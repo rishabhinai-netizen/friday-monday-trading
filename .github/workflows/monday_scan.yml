@@ -1,0 +1,46 @@
+name: Monday Gap Scanner
+
+on:
+  schedule:
+    # Runs every Monday at 09:40 IST (04:10 UTC)
+    # Changed from 9:20 to 9:40 to account for 15-min yfinance delay
+    # Market opens 9:15, data available ~9:30, scan at 9:40
+    - cron: '10 4 * * 1'
+  
+  # Allows manual trigger from GitHub UI
+  workflow_dispatch:
+
+jobs:
+  monday-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: |
+          pip install pandas yfinance
+      
+      - name: Run Monday Gap Scanner and Send Email
+        env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+        run: |
+          python email_automation.py monday
+      
+      - name: Upload signals artifact
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: monday-signals
+          path: monday_signals_*.csv
+          retention-days: 7
