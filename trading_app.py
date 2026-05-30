@@ -393,6 +393,13 @@ with tab2:
             .map(colour_pnl, subset=['Avg Gross %','Avg Net %']),
             hide_index=True, use_container_width=True
         )
+        if 'bear' in regime_filter and len(regime_filter) == 1:
+            all_yrs = set(range(trades['year'].min(), trades['year'].max()+1))
+            shown   = set(ystat['year'].tolist())
+            missing = sorted(all_yrs - shown)
+            if missing:
+                st.caption(f"⚪ Years not shown ({', '.join(map(str,missing))}) had zero bear-regime trades "
+                           f"— Nifty 50 was above its 200-DMA in those years, so no signals triggered.")
 
         st.divider()
 
@@ -423,35 +430,45 @@ with tab2:
         st.divider()
 
         # ── Top stocks ────────────────────────────────────────────────────
-        st.markdown('<div class="section-header">Top Stocks by Avg Gross P&L (min 15 trades)</div>', unsafe_allow_html=True)
-
         stock_stats = (trades
             .groupby(['symbol','stock_name','sector','tier'])
             .agg(trades_=('is_win','count'), wr=('is_win',lambda x: x.mean()*100),
                  avg_g=('gross_pnl_pct','mean'), total_g=('gross_pnl_pct','sum'))
-            .reset_index()
-            .query('trades_ >= 15')
+            .reset_index())
+
+        # Lower min-trades threshold when bear-only (avg ~5 bear trades per stock)
+        min_t = 5 if set(regime_filter) <= {'bear','sideways'} else 15
+        stock_stats = (stock_stats
+            .query(f'trades_ >= {min_t}')
             .sort_values('avg_g', ascending=False))
 
-        top25 = stock_stats.head(25)
-        fig_top = go.Figure()
-        fig_top.add_trace(go.Bar(
-            y=top25['symbol'], x=top25['avg_g'], orientation='h',
-            marker_color=['#1a6b3c' if v >= 0 else '#B5282A' for v in top25['avg_g']]))
-        fig_top.update_layout(
-            height=500, yaxis_title='', xaxis_title='Avg Gross P&L %',
-            plot_bgcolor='#FFFAF6', paper_bgcolor='#FFFAF6', margin=dict(t=10,b=10))
-        st.plotly_chart(fig_top, use_container_width=True)
+        st.markdown(f'<div class="section-header">Top Stocks by Avg Gross P&L (min {min_t} trades)</div>',
+            unsafe_allow_html=True)
 
-        with st.expander("📋 Full Stock Performance Table"):
-            disp2 = stock_stats[['symbol','stock_name','sector','tier','trades_','wr','avg_g','total_g']].copy()
-            disp2.columns = ['Symbol','Name','Sector','Tier','Trades','Win Rate %','Avg Gross %','Total Gross %']
-            st.dataframe(
-                disp2.style
-                .format({'Win Rate %':'{:.1f}','Avg Gross %':'{:+.3f}','Total Gross %':'{:+.1f}'})
-                .map(colour_pnl, subset=['Avg Gross %']),
-                hide_index=True, use_container_width=True
-            )
+        if stock_stats.empty:
+            st.info(f"No stocks have ≥{min_t} trades with current filters.")
+        else:
+            top25 = stock_stats.head(25)
+            fig_top = go.Figure()
+            fig_top.add_trace(go.Bar(
+                y=top25['symbol'], x=top25['avg_g'], orientation='h',
+                marker_color=['#1a6b3c' if v >= 0 else '#B5282A' for v in top25['avg_g']],
+                text=[f"{v:+.3f}%" for v in top25['avg_g']], textposition='outside'))
+            fig_top.update_layout(
+                height=max(350, len(top25)*22), yaxis_title='', xaxis_title='Avg Gross P&L %',
+                plot_bgcolor='#FFFAF6', paper_bgcolor='#FFFAF6', margin=dict(t=10,b=10,r=60))
+            st.plotly_chart(fig_top, use_container_width=True)
+
+            with st.expander("📋 Full Stock Performance Table"):
+                disp2 = stock_stats[['symbol','stock_name','sector','tier','trades_','wr','avg_g','total_g']].copy()
+                disp2.columns = ['Symbol','Name','Sector','Tier','Trades','Win Rate %','Avg Gross %','Total Gross %']
+                st.dataframe(
+                    disp2.style
+                    .format({'Win Rate %':'{:.1f}','Avg Gross %':'{:+.3f}','Total Gross %':'{:+.1f}'})
+                    .map(colour_pnl, subset=['Avg Gross %'])
+                    .map(style_wr,   subset=['Win Rate %']),
+                    hide_index=True, use_container_width=True
+                )
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 3 — STRATEGY INTELLIGENCE
