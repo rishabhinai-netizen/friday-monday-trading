@@ -86,6 +86,33 @@ def colour_pnl(val):
     c = "#1a6b3c" if val >= 0 else "#B5282A"
     return f"color:{c}; font-weight:600"
 
+def style_wr(val):
+    """CSS win-rate colouring — no matplotlib needed."""
+    if not isinstance(val, (int, float)) or pd.isna(val): return ''
+    if val >= 60: return 'background-color:#c8f0d8;color:#0d4a28;font-weight:700'
+    if val >= 50: return 'background-color:#e6f4ec;color:#1a6b3c;font-weight:600'
+    if val >= 40: return 'background-color:#fef5e0;color:#9a6b1a;font-weight:600'
+    return 'background-color:#fde8e8;color:#B5282A;font-weight:500'
+
+@st.cache_data(ttl=1800)
+def get_nifty_regime():
+    """Download 400 days so the 200-DMA is always valid. Returns (regime, last, sma200, sma50)."""
+    import yfinance as yf
+    start = (date.today() - timedelta(days=400)).strftime('%Y-%m-%d')
+    nifty = yf.download('^NSEI', start=start, auto_adjust=True, progress=False)
+    if isinstance(nifty.columns, pd.MultiIndex):
+        for lvl in range(nifty.columns.nlevels):
+            if 'Close' in nifty.columns.get_level_values(lvl):
+                nifty.columns = nifty.columns.get_level_values(lvl); break
+    close = nifty['Close'].dropna()
+    last  = float(close.iloc[-1])
+    s200  = float(close.rolling(200).mean().iloc[-1])
+    s50   = float(close.rolling(50).mean().iloc[-1])
+    if last < s200 * 0.95:   regime = 'bear'
+    elif last > s200 * 1.05: regime = 'bull'
+    else:                    regime = 'sideways'
+    return regime, last, s200, s50
+
 # ── Data loading ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def load_data():
@@ -129,7 +156,8 @@ with st.sidebar:
         help="Skip trades where Monday Open fell below Friday Low (no valid SHORT setup).")
     regime_filter = st.multiselect(
         "Market Regime", ['bear','sideways','bull'],
-        default=['bear','sideways','bull'])
+        default=['bear'],
+        help="Strategy has positive EV only in bear regime. Recommended: bear only.")
     max_stop_width = st.slider("Max Stop Width %", 0.5, 3.0, 3.0, 0.1,
         help="Distance from entry to Friday High (stop). Tighter = better R:R.")
     min_gap = st.slider("Min Gap Down %", 0.3, 2.0, 0.3, 0.1)
@@ -180,17 +208,87 @@ with tab1:
     if len(trades) == 0:
         st.warning("No trades match current filters. Adjust sidebar parameters.")
     else:
+        # ── Current regime banner ─────────────────────────────────────────
+        try:
+            live_reg, live_last, live_s200, live_s50 = get_nifty_regime()
+        except Exception:
+            live_reg, live_last, live_s200, live_s50 = 'unknown', 0, 0, 0
+
+        reg_color = {'bear':'#1a6b3c','sideways':'#9a6b1a','bull':'#B5282A'}.get(live_reg,'#666')
+        reg_icon  = {'bear':'🐻','sideways':'➡️','bull':'🐂'}.get(live_reg,'❓')
+        reg_action = {'bear':'✅ Active trading regime','sideways':'⚠️ Wait for bear','bull':'❌ Stay out'}.get(live_reg,'—')
+        st.markdown(f"""<div style="background:{'#f0faf4' if live_reg=='bear' else '#fffaf0' if live_reg=='sideways' else '#fff5f5'};
+            border:2px solid {reg_color};border-radius:12px;padding:14px 20px;margin-bottom:16px;
+            display:flex;align-items:center;gap:16px;">
+          <div style="font-size:36px;">{reg_icon}</div>
+          <div>
+            <div style="font-size:18px;font-weight:700;color:{reg_color};">
+              Current Regime: {live_reg.upper()} — {reg_action}
+            </div>
+            <div style="font-size:12px;color:#666;margin-top:3px;">
+              Nifty 50: {live_last:,.0f} &nbsp;•&nbsp; 200-DMA: {live_s200:,.0f} &nbsp;•&nbsp; 50-DMA: {live_s50:,.0f}
+              &nbsp;•&nbsp; <em>Auto-refreshes every 30 min</em>
+            </div>
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+        # ── Regime comparison — the key message ───────────────────────────
+        st.markdown('<div class="section-header">Strategy Performance by Market Regime (15 Years)</div>', unsafe_allow_html=True)
+
+        valid_all = all_trades[all_trades['valid']]
+        reg_cols  = st.columns(3)
+        for col, reg, icon, bg in zip(reg_cols,
+            ['bear','sideways','bull'], ['🐻','➡️','🐂'],
+            ['#e6f4ec','#fffaf0','#fff5f5']):
+            sub = valid_all[valid_all['regime'] == reg]
+            if len(sub) == 0: continue
+            r_wr  = sub['is_win'].mean() * 100
+            r_avg = sub['gross_pnl_pct'].mean()
+            r_net = sub['net_pnl_pct'].mean()
+            wins  = sub[sub['is_win']]
+            loss  = sub[~sub['is_win']]
+            r_w   = wins['gross_pnl_pct'].mean() if len(wins) else 0
+            r_l   = loss['gross_pnl_pct'].mean() if len(loss) else 0
+            clr   = '#1a6b3c' if r_avg >= 0 else '#9a6b1a' if r_avg > -0.3 else '#B5282A'
+            verdict = '✅ PROFITABLE' if r_avg >= 0 else ('⚠️ MARGINAL' if r_avg > -0.3 else '❌ AVOID')
+            is_current = (reg == live_reg)
+            border = f'3px solid {clr}' if is_current else f'1px solid #ddd'
+            with col:
+                st.markdown(f"""<div style="background:{bg};border:{border};border-radius:12px;
+                    padding:16px;text-align:center;{'box-shadow:0 2px 12px rgba(0,0,0,0.10);' if is_current else ''}">
+                  <div style="font-size:13px;font-weight:700;color:#555;letter-spacing:.05em;text-transform:uppercase;margin-bottom:6px;">
+                    {icon} {reg.title()} Regime {'← Current' if is_current else ''}
+                  </div>
+                  <div style="font-size:22px;font-weight:800;color:{clr};margin-bottom:4px;">{verdict}</div>
+                  <div style="font-size:28px;font-weight:700;color:{clr};font-family:'Playfair Display',serif;">
+                    WR {r_wr:.1f}%
+                  </div>
+                  <div style="font-size:13px;color:{clr};font-weight:600;margin-top:4px;">
+                    Avg gross {r_avg:+.3f}% &nbsp;|&nbsp; Net {r_net:+.3f}%
+                  </div>
+                  <div style="font-size:11px;color:#888;margin-top:6px;">
+                    Avg win {r_w:+.2f}% / Avg loss {r_l:+.2f}%<br>
+                    {len(sub):,} trades over 15 years
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+        st.divider()
+
+        # ── Filtered stats ─────────────────────────────────────────────────
+        reg_label = ', '.join([r.upper() for r in regime_filter]) if regime_filter else 'ALL'
+        st.markdown(f'<div class="section-header">Results for: {reg_label} Regime Filter</div>',
+            unsafe_allow_html=True)
+
         wr    = trades['is_win'].mean() * 100
         wins  = trades[trades['is_win']]
         loss  = trades[~trades['is_win']]
         avg_g = trades['gross_pnl_pct'].mean()
         avg_n = trades['net_pnl_pct'].mean()
-        avg_w = wins['gross_pnl_pct'].mean()  if len(wins)  else 0
-        avg_l = loss['gross_pnl_pct'].mean()  if len(loss)  else 0
+        avg_w = wins['gross_pnl_pct'].mean() if len(wins) else 0
+        avg_l = loss['gross_pnl_pct'].mean() if len(loss) else 0
         pf    = (abs(wins['gross_pnl_pct'].sum()) / abs(loss['gross_pnl_pct'].sum())
                  if len(loss) and loss['gross_pnl_pct'].sum() != 0 else 0)
 
-        # ── Top KPIs ──────────────────────────────────────────────────────
         k1, k2, k3, k4 = st.columns(4)
         with k1:
             clr = "kpi-green" if wr >= 50 else "kpi-red"
@@ -203,87 +301,50 @@ with tab1:
             st.markdown(kpi("Avg Net P&L", f"{avg_n:+.3f}%", f"after {COST_PCT}% costs", clr), unsafe_allow_html=True)
         with k4:
             clr = "kpi-green" if pf >= 1.0 else "kpi-red"
-            st.markdown(kpi("Profit Factor", f"{pf:.3f}", "wins÷losses", clr), unsafe_allow_html=True)
+            st.markdown(kpi("Profit Factor", f"{pf:.3f}", "need >1.0 to profit", clr), unsafe_allow_html=True)
 
         st.divider()
 
-        # ── Win/Loss profile ──────────────────────────────────────────────
         m1, m2, m3, m4, m5, m6 = st.columns(6)
-        with m1: st.metric("Winning Trades", f"{len(wins):,}")
-        with m2: st.metric("Losing Trades",  f"{len(loss):,}")
+        with m1: st.metric("Winning Trades",  f"{len(wins):,}")
+        with m2: st.metric("Losing Trades",   f"{len(loss):,}")
         with m3: st.metric("Avg Win",  f"{avg_w:+.3f}%")
         with m4: st.metric("Avg Loss", f"{avg_l:+.3f}%")
-        with m5: st.metric("Stocks Covered", f"{trades['symbol'].nunique()}")
-        with m6: st.metric("Years", f"{trades['year'].nunique()}")
+        with m5: st.metric("Stocks",   f"{trades['symbol'].nunique()}")
+        with m6: st.metric("Years",    f"{trades['year'].nunique()}")
 
         st.divider()
 
-        # ── Regime breakdown ──────────────────────────────────────────────
-        st.markdown('<div class="section-header">Performance by Market Regime</div>', unsafe_allow_html=True)
+        # ── Best sectors in bear regime ───────────────────────────────────
+        st.markdown('<div class="section-header">Best Sectors in Bear Regime</div>', unsafe_allow_html=True)
 
-        reg_cols = st.columns(3)
-        for col, reg, icon in zip(reg_cols, ['bear','sideways','bull'], ['🐻','➡️','🐂']):
-            sub = all_trades[all_trades['valid'] & (all_trades['regime'] == reg)]
-            if len(sub) == 0:
-                continue
-            r_wr  = sub['is_win'].mean() * 100
-            r_avg = sub['gross_pnl_pct'].mean()
-            clr   = "#1a6b3c" if r_avg >= 0 else "#B5282A"
-            label = "✅ Positive EV" if r_avg >= 0 else ("⚠️ Marginal" if r_avg > -0.3 else "❌ Negative EV")
-            with col:
-                st.markdown(f"""<div class="kpi-box">
-                    <div class="kpi-label">{icon} {reg.title()} Regime</div>
-                    <div style="font-size:20px;font-weight:700;color:{clr};">{label}</div>
-                    <div class="kpi-sub">WR {r_wr:.1f}%  •  Avg {r_avg:+.3f}%  •  {len(sub):,} trades</div>
-                </div>""", unsafe_allow_html=True)
+        bear_sec = (valid_all[valid_all['regime']=='bear']
+                    .groupby('sector')
+                    .agg(trades_=('is_win','count'), wr=('is_win',lambda x: x.mean()*100), avg_g=('gross_pnl_pct','mean'))
+                    .reset_index().query('trades_ >= 10').sort_values('avg_g', ascending=False)
+                    .head(10))
 
-        st.divider()
+        fig_sec_bear = go.Figure()
+        fig_sec_bear.add_trace(go.Bar(
+            x=bear_sec['sector'], y=bear_sec['avg_g'],
+            marker_color=['#1a6b3c' if v >= 0 else '#B5282A' for v in bear_sec['avg_g']],
+            text=[f"{v:+.2f}%" for v in bear_sec['avg_g']],
+            textposition='outside'))
+        fig_sec_bear.update_layout(
+            height=280, xaxis_title='', yaxis_title='Avg Gross P&L %',
+            plot_bgcolor='#FFFAF6', paper_bgcolor='#FFFAF6',
+            margin=dict(t=10,b=40), xaxis_tickangle=-30)
+        st.plotly_chart(fig_sec_bear, use_container_width=True)
 
-        # ── Key observations ──────────────────────────────────────────────
-        st.markdown('<div class="section-header">Key Observations</div>', unsafe_allow_html=True)
-        o1, o2 = st.columns(2)
-
-        bear_sub = all_trades[all_trades['valid'] & (all_trades['regime']=='bear')]
-        bull_sub = all_trades[all_trades['valid'] & (all_trades['regime']=='bull')]
-        r_b = bear_sub['gross_pnl_pct'].mean() if len(bear_sub) else 0
-        r_u = bull_sub['gross_pnl_pct'].mean() if len(bull_sub) else 0
-
-        top_sec = (all_trades[all_trades['valid'] & (all_trades['regime']=='bear')]
-                   .groupby('sector')['gross_pnl_pct'].mean()
-                   .nlargest(3).index.tolist())
-        top_sec_str = ", ".join(top_sec) if top_sec else "—"
-
-        with o1:
-            st.markdown(f"""<div class="stat-card">
-                <div class="stat-title">📌 Entry Rule: Monday Open must be above Friday Low</div>
-                <div class="stat-body">This filter removes setups where the gap is so large that
-                there is no room to run further down. Only trades where Monday Open &gt; Friday Low
-                (entry &gt; target) are valid shorts. Remaining {len(all_trades[all_trades['valid']]):,}
-                trades from the full {len(all_trades):,} qualify.</div>
-            </div>""", unsafe_allow_html=True)
-
-            st.markdown(f"""<div class="stat-card">
-                <div class="stat-title">📌 Stop Width Matters</div>
-                <div class="stat-body">Average win: <b>{avg_w:+.2f}%</b> vs average loss:
-                <b>{avg_l:+.2f}%</b>. A wide Friday High stop can give back multiple wins in one loss.
-                Use the Max Stop Width filter on the sidebar to focus on tighter setups.</div>
-            </div>""", unsafe_allow_html=True)
-
-        with o2:
-            st.markdown(f"""<div class="stat-card">
-                <div class="stat-title">📌 Regime is the Primary Edge Driver</div>
-                <div class="stat-body">Bear regime average: <b>{r_b:+.3f}%</b> per trade.
-                Bull regime average: <b>{r_u:+.3f}%</b> per trade. Nifty 50's position
-                relative to its 200-DMA is the single most important filter before entering
-                any trade from this system.</div>
-            </div>""", unsafe_allow_html=True)
-
-            st.markdown(f"""<div class="stat-card">
-                <div class="stat-title">📌 Best Sectors in Bear Regime</div>
-                <div class="stat-body">Top-performing sectors (by avg gross P&L) in bear markets:
-                <b>{top_sec_str}</b>. Prioritise these stocks when the watchlist is long and
-                you need to narrow down which signals to take.</div>
-            </div>""", unsafe_allow_html=True)
+        # small table with WR too
+        disp_sec = bear_sec[['sector','trades_','wr','avg_g']].copy()
+        disp_sec.columns = ['Sector','Trades','Win Rate %','Avg Gross %']
+        st.dataframe(
+            disp_sec.style
+            .format({'Win Rate %':'{:.1f}','Avg Gross %':'{:+.3f}'})
+            .map(colour_pnl, subset=['Avg Gross %'])
+            .map(style_wr,   subset=['Win Rate %']),
+            hide_index=True, use_container_width=True)
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 2 — BACKTEST RESULTS
@@ -509,24 +570,13 @@ with tab4:
     if st.button("🔄 Check Current Nifty Regime", type="primary"):
         with st.spinner("Fetching Nifty 50…"):
             try:
-                import yfinance as yf
-                nifty = yf.download('^NSEI', period='1y', auto_adjust=True, progress=False)
-                if isinstance(nifty.columns, pd.MultiIndex):
-                    for lvl in range(nifty.columns.nlevels):
-                        if 'Close' in nifty.columns.get_level_values(lvl):
-                            nifty.columns = nifty.columns.get_level_values(lvl); break
-                close = nifty['Close'].dropna()
-                last  = float(close.iloc[-1])
-                s200  = float(close.rolling(200).mean().iloc[-1])
-                s50   = float(close.rolling(50).mean().iloc[-1])
-                if last < s200 * 0.95:
-                    reg, clr = "🐻 BEAR", "#1a6b3c"
-                elif last > s200 * 1.05:
-                    reg, clr = "🐂 BULL", "#B5282A"
-                else:
-                    reg, clr = "➡️ SIDEWAYS", "#9a6b1a"
-                st.markdown(f"<h3 style='color:{clr};'>{reg}</h3>", unsafe_allow_html=True)
-                st.caption(f"Nifty 50: {last:,.0f}  •  200-DMA: {s200:,.0f}  •  50-DMA: {s50:,.0f}")
+                get_nifty_regime.clear()
+                live_reg2, live_last2, live_s2002, live_s502 = get_nifty_regime()
+                reg_color2 = {'bear':'#1a6b3c','sideways':'#9a6b1a','bull':'#B5282A'}.get(live_reg2,'#666')
+                reg_label2 = {'bear':'🐻 BEAR — Trade this strategy','sideways':'➡️ SIDEWAYS — Wait for bear','bull':'🐂 BULL — Avoid this strategy'}.get(live_reg2, live_reg2)
+                st.markdown(f"<h3 style='color:{reg_color2};'>{reg_label2}</h3>", unsafe_allow_html=True)
+                st.caption(f"Nifty 50: {live_last2:,.0f}  •  200-DMA: {live_s2002:,.0f}  •  50-DMA: {live_s502:,.0f}")
+                st.caption(f"Bear condition: Nifty < 200-DMA × 0.95 (= {live_s2002*0.95:,.0f})")
             except Exception as e:
                 st.error(f"Could not fetch: {e}")
 
@@ -559,16 +609,11 @@ with tab4:
                 for chunk in [symbols[i:i+65] for i in range(0, len(symbols), 65)]:
                     all_data.update(download_batch(chunk, scan_start, scan_end))
 
-                # Regime
-                ndata  = yf.download('^NSEI', start=scan_start, auto_adjust=True, progress=False)
-                if isinstance(ndata.columns, pd.MultiIndex):
-                    for lvl in range(ndata.columns.nlevels):
-                        if 'Close' in ndata.columns.get_level_values(lvl):
-                            ndata.columns = ndata.columns.get_level_values(lvl); break
-                nc     = ndata['Close'].dropna()
-                nlast  = float(nc.iloc[-1])
-                ns200  = float(nc.rolling(200).mean().iloc[-1])
-                regime_now = 'bear' if nlast < ns200*0.95 else ('bull' if nlast > ns200*1.05 else 'sideways')
+                # Regime — use the same shared function (400-day window → proper 200-DMA)
+                try:
+                    regime_now, _, _, _ = get_nifty_regime()
+                except Exception:
+                    regime_now = 'unknown'
 
                 results = []
                 for sym, df in all_data.items():
@@ -679,17 +724,19 @@ with tab4:
                             sig_df = pd.DataFrame(sigs).sort_values('Hist WR%', ascending=False, na_position='last')
                             st.subheader(f"⚡ {len(sig_df)} Monday Trade Signal(s)")
                             st.dataframe(
-                                sig_df.style.format({
+                                sig_df.style
+                                .format({
                                     'Gap %':'{:.2f}%','Entry':'₹{:.2f}','Target ↓':'₹{:.2f}',
                                     'Stop ↑':'₹{:.2f}','Risk %':'{:.2f}%','Reward %':'{:.2f}%','R:R':'{:.2f}'
-                                }).background_gradient(subset=['Hist WR%'], cmap='RdYlGn', vmin=30, vmax=70),
+                                })
+                                .map(style_wr, subset=['Hist WR%']),
                                 hide_index=True, use_container_width=True)
                         else:
                             st.info("No gap-down signals from the Friday watchlist for this Monday.")
                     else:
                         st.dataframe(
                             wl_df.drop(columns=['Fri Date']).style
-                            .background_gradient(subset=['Hist WR%'], cmap='RdYlGn', vmin=30, vmax=70),
+                            .map(style_wr, subset=['Hist WR%']),
                             hide_index=True, use_container_width=True)
                 else:
                     st.info("No stocks meet the Friday setup condition this week.")
